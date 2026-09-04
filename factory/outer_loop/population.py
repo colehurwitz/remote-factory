@@ -125,15 +125,43 @@ class MAPElitesArchive:
     def all_individuals(self) -> list[Individual]:
         return list(self._grid.values())
 
-    def sample_parent(self, tournament_size: int = 3) -> Individual | None:
-        """Tournament selection: pick tournament_size random individuals, return the best."""
+    def sample_parent(
+        self,
+        tournament_size: int = 3,
+        rank_weighted: bool = False,
+        auto_rank_weighted: bool = True,
+        auto_rank_cell_threshold: int = 8,
+    ) -> Individual | None:
+        """Tournament selection: pick tournament_size individuals, return the best.
+
+        When ``rank_weighted=True``, individuals are drawn with probability
+        proportional to their rank (best=N, worst=1) instead of uniformly.
+        This biases toward stronger parents while still allowing weaker
+        individuals a small chance, preserving diversity.
+
+        When ``auto_rank_weighted=True`` (default), rank-weighted selection
+        activates automatically when the archive reaches
+        ``auto_rank_cell_threshold`` occupied cells, mirroring
+        ``on_plateau()``'s pattern of adapting strategy when the search
+        state calls for it.
+        """
         import random
 
         individuals = list(self._grid.values())
         if not individuals:
             return None
         k = min(tournament_size, len(individuals))
-        tournament = random.sample(individuals, k)
+
+        use_rank = rank_weighted
+        if not use_rank and auto_rank_weighted and len(individuals) >= auto_rank_cell_threshold:
+            use_rank = True
+
+        if use_rank and len(individuals) >= 2:
+            ranked = sorted(individuals, key=lambda i: i.score)
+            weights = [rank + 1.0 for rank in range(len(ranked))]
+            tournament = random.choices(ranked, weights=weights, k=k)
+        else:
+            tournament = random.sample(individuals, k)
         return max(tournament, key=lambda i: i.score)
 
     def pareto_front(self) -> list[Individual]:
