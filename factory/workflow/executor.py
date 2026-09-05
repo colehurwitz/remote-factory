@@ -843,7 +843,12 @@ class WorkflowExecutor:
         )
 
         if code != 0:
-            raise RuntimeError(f"agent {node.role.value} exited with code {code}")
+            log.warning(
+                "agent_nonzero_exit",
+                role=node.role.value,
+                code=code,
+                output_len=len(stdout),
+            )
 
         return stdout
 
@@ -890,7 +895,8 @@ class WorkflowExecutor:
         if node.evaluator_type == "fn":
             if node.evaluator_command:
                 cmd = node.evaluator_command.replace(
-                    "{project_path}", shlex.quote(str(self.project_path)),
+                    "{project_path}",
+                    shlex.quote(str(self.project_path)),
                 )
                 try:
                     output = await self._run_shell(cmd)
@@ -942,6 +948,23 @@ class WorkflowExecutor:
             reloop_targets=", ".join(reloop_targets) if reloop_targets else "(use exact node IDs)",
         )
 
+    @staticmethod
+    def _strip_markdown_decorators(line: str) -> str:
+        """Strip leading/trailing markdown formatting from a verdict line."""
+        import re
+
+        s = line.strip()
+        prev = None
+        while s != prev:
+            prev = s
+            s = re.sub(r"^#{1,6}\s+", "", s)
+            s = re.sub(r"^>\s?", "", s)
+            s = re.sub(r"^(?:\d+\.\s+|[-*]\s+)", "", s)
+            s = re.sub(r"^(`{1,3})|(`{1,3})$", "", s)
+            s = re.sub(r"^(\*{1,3}|_{1,3})|(\*{1,3}|_{1,3})$", "", s)
+            s = s.strip()
+        return s
+
     def _parse_agent_verdict(self, output: str, gate_id: str) -> Verdict:
         """Parse agent output into a Verdict by examining the last non-empty line."""
         import re
@@ -953,7 +976,7 @@ class WorkflowExecutor:
                 last_line = line.strip()
                 break
 
-        text = last_line.upper()
+        text = self._strip_markdown_decorators(last_line).upper()
 
         if text.startswith("HALT") or re.match(r"^HALT\b", text):
             reason_match = re.search(r'REASON="([^"]+)"', last_line, re.IGNORECASE)
@@ -989,7 +1012,7 @@ class WorkflowExecutor:
                 break
 
         if first_line and first_line != last_line:
-            ft = first_line.upper()
+            ft = self._strip_markdown_decorators(first_line).upper()
 
             if ft.startswith("HALT") or re.match(r"^HALT\b", ft):
                 reason_match = re.search(r'REASON="([^"]+)"', first_line, re.IGNORECASE)
@@ -1062,14 +1085,25 @@ class WorkflowExecutor:
             )
         )
 
-    async def _run_shell(self, cmd: str) -> str:
-        """Run a shell command and return stdout."""
-        proc = await asyncio.create_subprocess_shell(
-            cmd,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=self.project_path,
-        )
+    async def _run_shell_or_exec(self, cmd: str) -> str:
+        """Run a command, using exec mode for python3 -c to avoid quote issues."""
+        import re
+        m = re.match(r"""^python3\s+-c\s+(['"])(.*)\1\s*$""", cmd, re.DOTALL)
+        if m:
+            code = m.group(2)
+            proc = await asyncio.create_subprocess_exec(
+                "python3", "-c", code,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.project_path,
+            )
+        else:
+            proc = await asyncio.create_subprocess_shell(
+                cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=self.project_path,
+            )
         stdout_bytes, stderr_bytes = await proc.communicate()
         stdout = stdout_bytes.decode() if stdout_bytes else ""
 
@@ -1080,6 +1114,10 @@ class WorkflowExecutor:
             )
 
         return stdout
+
+    async def _run_shell(self, cmd: str) -> str:
+        """Run a shell command and return stdout."""
+        return await self._run_shell_or_exec(cmd)
 
     async def _wait_for_reads(self, node: NodeType) -> None:
         """Wait until all files in node.reads are available in completed_files."""

@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import random
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from collections.abc import Callable
+from typing import Protocol, runtime_checkable
 
 import networkx as nx
 import structlog
@@ -19,8 +20,7 @@ from factory.workflow.primitives import (
     Workflow,
 )
 
-if TYPE_CHECKING:
-    from factory.outer_loop.reflector import ReflectionReport
+from factory.outer_loop.reflector import ReflectionReport
 
 log = structlog.get_logger()
 
@@ -48,13 +48,14 @@ class WeightedRandomStrategy:
         designer_ratio: float = 0.3,
     ) -> None:
         self.weights = weights or {
-            MutationType.NODE_INSERT.value: 0.18,
-            MutationType.NODE_REMOVE.value: 0.13,
-            MutationType.EDGE_REDIRECT.value: 0.18,
-            MutationType.PARALLELIZE.value: 0.13,
-            MutationType.SERIALIZE.value: 0.08,
-            MutationType.PARAM_MUTATE.value: 0.15,
-            MutationType.PROMPT_MUTATE.value: 0.15,
+            MutationType.NODE_INSERT.value: 0.15,
+            MutationType.NODE_REMOVE.value: 0.10,
+            MutationType.EDGE_REDIRECT.value: 0.15,
+            MutationType.PARALLELIZE.value: 0.10,
+            MutationType.SERIALIZE.value: 0.05,
+            MutationType.PARAM_MUTATE.value: 0.10,
+            MutationType.PROMPT_MUTATE.value: 0.10,
+            MutationType.KNOB_MUTATE.value: 0.25,
         }
         self._mutation_rate = mutation_rate
         self._designer_ratio = designer_ratio
@@ -86,6 +87,8 @@ class WeightedRandomStrategy:
                 op_counts[MutationType.PARAM_MUTATE] = op_counts.get(MutationType.PARAM_MUTATE, 0) + 1
             elif "PROMPT_MUTATE" in upper:
                 op_counts[MutationType.PROMPT_MUTATE] = op_counts.get(MutationType.PROMPT_MUTATE, 0) + 1
+            elif "KNOB" in upper:
+                op_counts[MutationType.KNOB_MUTATE] = op_counts.get(MutationType.KNOB_MUTATE, 0) + 1
 
         if not op_counts:
             return self.select_operator(parent, generation, {})
@@ -120,6 +123,17 @@ def validate_and_repair(workflow: Workflow) -> Workflow | None:
     for edge in workflow.edges:
         if edge.source in workflow.nodes and edge.target in workflow.nodes:
             g.add_edge(edge.source, edge.target)
+    # ForkNode.targets and JoinNode.sources declare implicit edges
+    # that nx.descendants must follow for correct reachability.
+    for nid, node in workflow.nodes.items():
+        if isinstance(node, ForkNode):
+            for target in node.targets:
+                if target in workflow.nodes:
+                    g.add_edge(nid, target)
+        elif isinstance(node, JoinNode):
+            for source in node.sources:
+                if source in workflow.nodes:
+                    g.add_edge(source, nid)
 
     if workflow.start_node not in workflow.nodes:
         return None
@@ -189,6 +203,9 @@ def _deep_copy_workflow(workflow: Workflow) -> Workflow:
         edges=edges,
         start_node=workflow.start_node,
         terminal=workflow.terminal,
+        knob_values=dict(workflow.knob_values),
+        knob_bounds={k: list(v) for k, v in workflow.knob_bounds.items()},
+        knob_expandable=dict(workflow.knob_expandable),
     )
 
 
@@ -509,14 +526,111 @@ _PROMPT_VARIANTS = [
 MAX_NODES = 30
 
 
+PromptRewriter = Callable[[str, str, str | None], str | None]
+
+
+def default_prompt_rewriter(
+    node_id: str,
+    current_prompt: str,
+    hint: str | None,
+) -> str | None:
+    """Default prompt rewriter: uses claude CLI to rewrite an agent prompt."""
+    import subprocess
+
+    context = f"Hint from reflection: {hint}" if hint else "No specific hint."
+    prompt = (
+        f"You are improving an AI agent's prompt. The agent's role is '{node_id}'.\n\n"
+        f"Current prompt:\n{current_prompt}\n\n"
+        f"{context}\n\n"
+        f"Write an improved version of this prompt. Keep the same role and format. "
+        f"Make it more specific, fix any issues the hint identifies, and remove "
+        f"any contradictory or redundant instructions. "
+        f"Output ONLY the new prompt text, nothing else."
+    )
+    from factory.runners.claude import _claude_bin
+
+    try:
+        proc = subprocess.run(
+            [_claude_bin(), "-p", prompt, "--model", "opus",
+             "--append-system-prompt", "Output only the prompt text.",
+             "--max-turns", "1", "--output-format", "text"],
+            capture_output=True, text=True, timeout=120,
+        )
+        result = proc.stdout.strip()
+        if result:
+            log.info("prompt_rewritten", node=node_id, len=len(result))
+        else:
+            log.warning("prompt_rewriter_empty", node=node_id)
+        return result if result else None
+    except subprocess.TimeoutExpired:
+        log.warning("prompt_rewriter_timeout", node=node_id, timeout=120)
+        return None
+    except Exception as exc:
+        log.warning("prompt_rewriter_error", node=node_id, error=str(exc))
+        return None
+
+
+async def async_prompt_rewriter(
+    node_id: str,
+    current_prompt: str,
+    hint: str | None,
+) -> str | None:
+    """Async prompt rewriter: uses claude CLI without blocking the event loop."""
+    import asyncio as _asyncio
+
+    context = f"Hint from reflection: {hint}" if hint else "No specific hint."
+    prompt = (
+        f"You are improving an AI agent's prompt. The agent's role is '{node_id}'.\n\n"
+        f"Current prompt:\n{current_prompt}\n\n"
+        f"{context}\n\n"
+        f"Write an improved version of this prompt. Keep the same role and format. "
+        f"Make it more specific, fix any issues the hint identifies, and remove "
+        f"any contradictory or redundant instructions. "
+        f"Output ONLY the new prompt text, nothing else."
+    )
+    from factory.runners.claude import _claude_bin
+
+    try:
+        proc = await _asyncio.create_subprocess_exec(
+            _claude_bin(), "-p", prompt, "--model", "opus",
+            "--append-system-prompt", "Output only the prompt text.",
+            "--max-turns", "1", "--output-format", "text",
+            stdout=_asyncio.subprocess.PIPE,
+            stderr=_asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await _asyncio.wait_for(proc.communicate(), timeout=120.0)
+        result = stdout.decode().strip() if stdout else ""
+        if result:
+            log.info("prompt_rewritten", node=node_id, len=len(result))
+        else:
+            log.warning("prompt_rewriter_empty", node=node_id)
+        return result if result else None
+    except _asyncio.TimeoutError:
+        log.warning("prompt_rewriter_timeout", node=node_id, timeout=120)
+        try:
+            proc.kill()  # type: ignore[possibly-undefined]
+        except Exception:
+            pass
+        return None
+    except Exception as exc:
+        log.warning("prompt_rewriter_error", node=node_id, error=str(exc))
+        return None
+
+
 def mutate_prompt(
     workflow: Workflow,
     node_id: str,
     *,
     frozen_nodes: set[str] | None = None,
     prompt_hint: str | None = None,
+    rewriter: PromptRewriter | None = default_prompt_rewriter,
 ) -> tuple[Workflow, MutationRecord] | None:
-    """Mutate the prompt_template of an AgentNode."""
+    """Mutate the prompt_template of an AgentNode.
+
+    When a rewriter is provided, it REPLACES the prompt (informed by the
+    current prompt + hint). When no rewriter is available, falls back to
+    appending a hint or random variant.
+    """
     frozen = frozen_nodes or set()
     if node_id in frozen:
         return None
@@ -527,17 +641,29 @@ def mutate_prompt(
         return None
 
     old_prompt = node.prompt_template or ""
-    if prompt_hint:
-        new_prompt = f"{old_prompt}\n\n{prompt_hint}" if old_prompt else prompt_hint
-    else:
-        variant = random.choice(_PROMPT_VARIANTS)
-        new_prompt = f"{old_prompt}\n\n{variant}" if old_prompt else variant
+    new_prompt: str | None = None
+
+    if rewriter is not None:
+        new_prompt = rewriter(node_id, old_prompt, prompt_hint)
+
+    if not new_prompt:
+        if prompt_hint:
+            new_prompt = f"{old_prompt}\n\n{prompt_hint}" if old_prompt else prompt_hint
+        else:
+            variant = random.choice(_PROMPT_VARIANTS)
+            new_prompt = f"{old_prompt}\n\n{variant}" if old_prompt else variant
 
     try:
         updated = node.model_copy(update={"prompt_template": new_prompt})
         wf.nodes[node_id] = updated  # type: ignore[assignment]
-    except Exception:
+    except Exception as exc:
+        log.warning("prompt_mutate_validation_failed", node=node_id, error=str(exc))
         return None
+
+    # Persist in knob_values so the mutation survives Package.compile() round-trips
+    prompt_knob = f"_prompt_{node_id}"
+    wf.knob_values[prompt_knob] = new_prompt
+    wf.knob_expandable[prompt_knob] = f"Prompt for {node_id}"
 
     record = MutationRecord(
         operator=MutationType.PROMPT_MUTATE,
@@ -545,6 +671,157 @@ def mutate_prompt(
         before={"prompt": old_prompt[:100]},
         after={"prompt": new_prompt[:100]},
         rationale=f"Mutated prompt on {node_id}",
+    )
+    return wf, record
+
+
+KnobExpander = Callable[[str, str, str | float, list[str | float]], str | float | None]
+
+
+def default_knob_expander(
+    knob_name: str,
+    hint: str,
+    current: str | float,
+    bounds: list[str | float],
+) -> str | float | None:
+    """Default expander: uses claude CLI to invent new knob values."""
+    import subprocess
+
+    prompt = (
+        f"Invent a new value for the parameter '{knob_name}'.\n"
+        f"Context: {hint}\n"
+        f"Current value: {current}\n"
+        f"Existing options: {bounds}\n\n"
+        f"Write ONLY the new value (a short name if it's a prompt knob, "
+        f"or a number if it's a threshold). Nothing else."
+    )
+    from factory.runners.claude import _claude_bin
+
+    try:
+        proc = subprocess.run(
+            [_claude_bin(), "-p", prompt, "--model", "opus",
+             "--append-system-prompt", "Output only the value, no explanation.",
+             "--max-turns", "1", "--output-format", "text"],
+            capture_output=True, text=True, timeout=120,
+        )
+        result = proc.stdout.strip()
+        if not result:
+            log.warning("knob_expander_empty", knob=knob_name)
+            return None
+        log.info("knob_expanded_via_cli", knob=knob_name, value=result[:40])
+        try:
+            return float(result)
+        except ValueError:
+            return result[:80]
+    except subprocess.TimeoutExpired:
+        log.warning("knob_expander_timeout", knob=knob_name, timeout=120)
+        return None
+    except Exception as exc:
+        log.warning("knob_expander_error", knob=knob_name, error=str(exc))
+        return None
+
+
+def _parse_knob_suggestion(
+    suggestion: str,
+) -> tuple[str, str] | None:
+    """Extract (knob_name, best_value) from a KNOB_MUTATE suggestion string."""
+    if not suggestion.startswith("KNOB_MUTATE:"):
+        return None
+    # Format: "KNOB_MUTATE: name=value (avg score +X) outperforms ..."
+    rest = suggestion[len("KNOB_MUTATE:"):].strip()
+    if "=" not in rest:
+        return None
+    name, _, after = rest.partition("=")
+    value = after.split()[0].rstrip("()") if after else ""
+    return (name.strip(), value) if name and value else None
+
+
+def mutate_knob(
+    workflow: Workflow,
+    *,
+    expander: KnobExpander | None = default_knob_expander,
+    reflection_report: ReflectionReport | None = None,
+) -> tuple[Workflow, MutationRecord] | None:
+    """Mutate a single knob value within its declared bounds.
+
+    When a reflection_report is provided with KNOB_MUTATE suggestions,
+    70% of the time picks the suggested knob and value (exploitation).
+    30% of the time picks randomly (exploration).
+
+    When all bounds are exhausted and the knob is expandable, calls
+    ``expander(knob_name, expansion_hint, current_value, bounds)`` to
+    generate a new value.
+    """
+    if not workflow.knob_values:
+        return None
+
+    wf = _deep_copy_workflow(workflow)
+    knob_names = list(wf.knob_values.keys())
+
+    # Try guided mutation from reflection suggestions (70% of the time)
+    guided_knob: str | None = None
+    guided_val: str | float | None = None
+    if reflection_report and random.random() < 0.7:
+        suggestions = [
+            _parse_knob_suggestion(s) for s in reflection_report.mutation_suggestions
+        ]
+        valid = [(k, v) for parsed in suggestions if parsed
+                 for k, v in [parsed] if k in wf.knob_values]
+        if valid:
+            guided_knob, guided_val = random.choice(valid)
+
+    if guided_knob and guided_val is not None:
+        knob_name = guided_knob
+        old_val = wf.knob_values[knob_name]
+        new_val: str | float | None = guided_val
+        # Coerce type to match existing value
+        if isinstance(old_val, float) and isinstance(new_val, str):
+            try:
+                new_val = float(new_val)
+            except ValueError:
+                pass
+        # Skip no-op: guided value same as current
+        if str(new_val) == str(old_val):
+            new_val = None
+            guided_knob = None
+    if not guided_knob:
+        # Exclude synthetic _prompt_* knobs (handled by PROMPT_MUTATE)
+        real_knobs = [k for k in knob_names if not k.startswith("_prompt_")]
+        if not real_knobs:
+            return None
+        knob_name = random.choice(real_knobs)
+        old_val = wf.knob_values[knob_name]
+        bounds = wf.knob_bounds.get(knob_name, [])
+        new_val = None
+
+        if bounds:
+            alternatives = [v for v in bounds if v != old_val]
+            if alternatives:
+                new_val = random.choice(alternatives)
+            elif knob_name in wf.knob_expandable and expander is not None:
+                hint = wf.knob_expandable[knob_name]
+                new_val = expander(knob_name, hint, old_val, bounds)
+                if new_val is not None:
+                    wf.knob_bounds.setdefault(knob_name, []).append(new_val)
+                    log.info("knob_expanded", knob=knob_name, new_value=new_val)
+
+    if new_val is None:
+        if isinstance(old_val, bool):
+            new_val = not old_val
+        elif isinstance(old_val, (int, float)):
+            delta = random.choice([-1, 1]) * max(1, abs(old_val) * 0.2)
+            new_val = type(old_val)(old_val + delta)
+        else:
+            return None
+
+    wf.knob_values[knob_name] = new_val
+
+    record = MutationRecord(
+        operator=MutationType.KNOB_MUTATE,
+        target_node=knob_name,
+        before={"value": str(old_val)},
+        after={"value": str(new_val)},
+        rationale=f"Mutated knob {knob_name}: {old_val} -> {new_val}",
     )
     return wf, record
 
@@ -557,12 +834,16 @@ def apply_random_mutation(
     frozen_nodes: set[str] | None = None,
     archive_stats: dict[str, object] | None = None,
     reflection_report: ReflectionReport | None = None,
+    knob_expander: KnobExpander | None = default_knob_expander,
     max_attempts: int = 10,
 ) -> tuple[Workflow, MutationRecord] | None:
     """Apply a mutation using the given strategy. Retries on failure.
 
     When reflection_report is provided, guided mutations are attempted first
     (70% of the time), falling back to random mutations.
+
+    When knob_expander is provided, KNOB_MUTATE can generate new values
+    beyond the declared bounds for expandable knobs.
     """
     frozen = frozen_nodes or set()
     stats = archive_stats or {}
@@ -584,7 +865,9 @@ def apply_random_mutation(
             op = MutationType.PARAM_MUTATE
 
         prompt_hint = _extract_prompt_hint(reflection_report) if reflection_report else None
-        result = _try_mutation(workflow, op, frozen, prompt_hint=prompt_hint)
+        result = _try_mutation(workflow, op, frozen, prompt_hint=prompt_hint,
+                               expander=knob_expander,
+                               reflection_report=reflection_report)
         if result is not None:
             wf, rec = result
             if len(wf.nodes) > MAX_NODES:
@@ -609,12 +892,13 @@ def _try_mutation(
     frozen: set[str],
     *,
     prompt_hint: str | None = None,
+    **kwargs: object,
 ) -> tuple[Workflow, MutationRecord] | None:
     """Attempt a single mutation of the given type."""
     mutable_nodes = [
         nid for nid in workflow.nodes if nid not in frozen and nid != workflow.start_node
     ]
-    if not mutable_nodes and op not in (MutationType.NODE_INSERT,):
+    if not mutable_nodes and op not in (MutationType.NODE_INSERT, MutationType.KNOB_MUTATE):
         return None
 
     if op == MutationType.NODE_INSERT:
@@ -683,5 +967,14 @@ def _try_mutation(
             return None
         target = random.choice(agent_nodes)
         return mutate_prompt(workflow, target, frozen_nodes=frozen, prompt_hint=prompt_hint)
+
+    elif op == MutationType.KNOB_MUTATE:
+        exp = kwargs.get("expander")
+        ref = kwargs.get("reflection_report")
+        return mutate_knob(
+            workflow,
+            expander=exp if callable(exp) else None,
+            reflection_report=ref if isinstance(ref, ReflectionReport) else None,
+        )
 
     return None
