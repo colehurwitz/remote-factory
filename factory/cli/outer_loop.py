@@ -56,7 +56,7 @@ def _make_inner_loop_factory(
     """Build a callable that finds the existing registered mode for a workflow.
 
     Looks up by structural hash instead of creating eval-copy modes.
-    This bridges SwarmEvaluator → FeatureBenchInnerLoop: without it,
+    This bridges SwarmEvaluator → compose() / InnerLoop: without it,
     _inner_loop_factory is None and evaluation returns a dummy score=0.0.
     """
     _hash_to_mode: dict[str, str] = {}
@@ -147,6 +147,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         resolved_instance_format = bench_config.instance_format if bench_config else "directory"
         resolved_prep_command = bench_config.prep_command if bench_config else ""
 
+        task_module = getattr(args, "task_module", "")
         config = SwarmConfig(
             benchmark=benchmark,
             budget=budget,
@@ -160,7 +161,10 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
             seed_workflow=resolved_seed_workflow,
             instance_format=resolved_instance_format,
             prep_command=resolved_prep_command,
+            task_module=task_module,
         )
+        if task_module:
+            _log.info("task_module_resolved", ref=task_module)
 
     root = init_filesystem(project_path, config)
 
@@ -246,6 +250,11 @@ def _cmd_evaluate(args: argparse.Namespace) -> int:
         print("Error: no outer loop config found. Run 'factory outer-loop calibrate' first.", file=sys.stderr)
         return 1
 
+    cli_task_module = getattr(args, "task_module", "")
+    if cli_task_module:
+        config = config.model_copy(update={"task_module": cli_task_module})
+        _log.info("task_module_override", ref=cli_task_module)
+
     eval_project_dir = getattr(args, "project_dir", None)
     if eval_project_dir is not None:
         eval_project_dir = str(Path(eval_project_dir).resolve())
@@ -316,6 +325,25 @@ def _load_cycle_summary(project_path: Path, mode_name: str) -> CycleRecord | Non
     try:
         data = json.loads(summary_path.read_text())
         duration_ms = data.get("duration_ms", 0)
+
+        instance_results = data.get("instance_results")
+
+        eval_details: dict[str, object] | None = None
+        verify = data.get("verify")
+        test_details = data.get("test_details")
+        if verify is not None or test_details is not None:
+            eval_details = {}
+            if verify is not None:
+                eval_details["verify"] = verify
+            if test_details is not None:
+                eval_details["test_details"] = test_details
+            rejected = data.get("rejected")
+            if rejected is not None:
+                eval_details["rejected"] = rejected
+            error = data.get("error")
+            if isinstance(error, str):
+                eval_details["error"] = error
+
         return CR(
             cycle_number=0,
             mode=mode_name,
@@ -329,6 +357,8 @@ def _load_cycle_summary(project_path: Path, mode_name: str) -> CycleRecord | Non
             reverted=data.get("reverted", 0),
             errored=data.get("agents_failed", 0),
             total_cost_usd=data.get("cost_usd", 0.0),
+            instance_results=instance_results,
+            eval_details=eval_details,
         )
     except (json.JSONDecodeError, OSError, ValueError, TypeError):
         return None
@@ -400,7 +430,13 @@ def _cmd_reflect(args: argparse.Namespace) -> int:
         print("Not enough candidates for reflection (need >= 2).", file=sys.stderr)
         return 1
 
-    report = reflector.reflect(records, generation)
+    kvbi: dict[str, dict[str, object]] = {}
+    for mode_name_r, _, _ in records:
+        wf = registry.load(mode_name_r)
+        if wf is not None and wf.knob_values:
+            kvbi[mode_name_r] = dict(wf.knob_values)
+
+    report = reflector.reflect(records, generation, knob_values_by_id=kvbi)
     print(f"Reflection complete: {len(report.failure_patterns)} failures, "
           f"{len(report.success_patterns)} successes, "
           f"{len(report.mutation_suggestions)} suggestions")
@@ -416,6 +452,7 @@ def _cmd_evolve(args: argparse.Namespace) -> int:
     from factory.outer_loop.filesystem import load_config
     from factory.outer_loop.mode_registry import EphemeralModeRegistry
     from factory.outer_loop.mutations import WeightedRandomStrategy, apply_random_mutation
+    from factory.outer_loop.reflector import ReflectionReport
 
     config = load_config(project_path)
     if config is None:
@@ -433,6 +470,20 @@ def _cmd_evolve(args: argparse.Namespace) -> int:
         print("Error: no ephemeral modes to evolve.", file=sys.stderr)
         return 1
 
+    reflection_report: ReflectionReport | None = None
+    reflection_path = (
+        project_path / ".factory" / "outer_loop" / "reflections" / f"gen{generation}.json"
+    )
+    if reflection_path.exists():
+        try:
+            data = json.loads(reflection_path.read_text())
+            reflection_report = ReflectionReport(
+                **{k: v for k, v in data.items() if k != "generation"}
+            )
+            _log.info("reflection_report_loaded", generation=generation)
+        except (json.JSONDecodeError, OSError, TypeError) as exc:
+            _log.warning("reflection_report_load_failed", error=str(exc))
+
     strategy = WeightedRandomStrategy(mutation_rate=config.mutation_rate)
     offspring_count = 0
 
@@ -443,6 +494,7 @@ def _cmd_evolve(args: argparse.Namespace) -> int:
         result = apply_random_mutation(
             wf, strategy, generation + 1,
             frozen_nodes=set(config.frozen_node_ids),
+            reflection_report=reflection_report,
         )
         if result is not None:
             child_wf, mutation_rec = result
@@ -613,6 +665,11 @@ def add_outer_loop_parser(subparsers: argparse._SubParsersAction) -> None:  # ty
         default="",
         help="Test output format: pytest, exit_code, json, exact_match (auto-detected from benchmark config if omitted)",
     )
+    cal.add_argument(
+        "--task-module",
+        default="",
+        help="Task class ref as 'module.path:ClassName' (e.g. chess_evolve.task:ChessEvolveTask)",
+    )
 
     ev = outer_sub.add_parser("evaluate", help="Evaluate current generation")
     ev.add_argument("project_path", nargs="?", default=".")
@@ -621,6 +678,11 @@ def add_outer_loop_parser(subparsers: argparse._SubParsersAction) -> None:  # ty
         "--project-dir",
         default=None,
         help="Target project dir for sub-CEO evaluation (defaults to project_path)",
+    )
+    ev.add_argument(
+        "--task-module",
+        default="",
+        help="Task class ref as 'module.path:ClassName' (overrides config value)",
     )
 
     ref = outer_sub.add_parser("reflect", help="Run reflection on generation")

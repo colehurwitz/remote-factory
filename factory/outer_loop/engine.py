@@ -268,10 +268,16 @@ class SwarmEngine:
         # Reflect on this generation's results
         if generation > 0 or len(population.individuals) >= 2:
             records = []
+            kvbi: dict[str, dict[str, object]] = {}
             for ind in population.individuals:
                 cycle_rec = self._evaluator.get_cycle_record(ind.id)
                 records.append((ind.id, ind.score, cycle_rec))
-            self._last_reflection = self._reflector.reflect(records, generation)
+                ind_wf = Workflow.from_dict(ind.workflow_data)  # type: ignore[arg-type]
+                if ind_wf.knob_values:
+                    kvbi[ind.id] = dict(ind_wf.knob_values)
+            self._last_reflection = self._reflector.reflect(
+                records, generation, knob_values_by_id=kvbi,
+            )
 
         # Select parents and create offspring
         mutations_applied: list[MutationRecord] = []
@@ -281,7 +287,10 @@ class SwarmEngine:
 
         mutation_rate = self._strategy.get_mutation_rate(generation)
         for _ in range(self._config.population_size):
-            parent = self._archive.sample_parent(self._config.tournament_size)
+            parent = self._archive.sample_parent(
+                self._config.tournament_size,
+                rank_weighted=self._config.rank_weighted_selection,
+            )
             if parent is None:
                 continue
             parent_wf = Workflow.from_dict(parent.workflow_data)  # type: ignore[arg-type]
