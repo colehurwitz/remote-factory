@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -17,6 +18,7 @@ class MutationType(str, Enum):
     SERIALIZE = "serialize"
     PARAM_MUTATE = "param_mutate"
     PROMPT_MUTATE = "prompt_mutate"
+    KNOB_MUTATE = "knob_mutate"
 
 
 class MutationRecord(BaseModel):
@@ -86,6 +88,7 @@ class SwarmConfig(BaseModel):
     budget: int
     population_size: int = 4
     tournament_size: int = 3
+    rank_weighted_selection: bool = False
     mutation_rate: float = 0.3
     target_score: float | None = None
     frozen_node_ids: list[str] = Field(default_factory=list)
@@ -108,6 +111,8 @@ class SwarmConfig(BaseModel):
     instance_format: str = "directory"
     prep_command: str = ""
     early_stop_unchanged: int = 3
+    task_module: str = ""
+    seed_workflow_module: str = ""
 
     @field_validator("holdout_instances")
     @classmethod
@@ -120,6 +125,42 @@ class SwarmConfig(BaseModel):
                 f"holdout_instances must not overlap with training_instances: {overlap}"
             )
         return v
+
+    # ── Task integration (not serialised — set at runtime) ───────
+
+    _task: Any = None  # set via set_task(), not a Pydantic field
+
+    def set_task(self, task: Any) -> None:
+        """Attach a Task object at runtime (not serialised)."""
+        object.__setattr__(self, "_task", task)
+
+    def get_task(self) -> Any:
+        """Return task via 3-tier precedence: set_task() > task_module > from_legacy().
+
+        Uses lazy import to avoid circular dependency.
+        """
+        if self._task is not None:
+            return self._task
+
+        if self.task_module:
+            from factory.task import TaskRef
+
+            task = TaskRef(ref=self.task_module).resolve()
+            object.__setattr__(self, "_task", task)
+            return task
+
+        from factory.task import Task
+
+        task = Task.from_legacy(
+            name=self.benchmark,
+            test_command=self.test_command,
+            test_format=self.test_format,
+            metric_path=self.metric_path,
+            instance_format=self.instance_format,
+            prep_command=self.prep_command,
+        )
+        object.__setattr__(self, "_task", task)
+        return task
 
 
 class OuterLoopState(BaseModel):

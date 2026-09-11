@@ -94,6 +94,12 @@ class Population:
         return pop
 
 
+# Structural axes from compute_features() 9-tuple:
+# 0=depth, 1=fork_degree, 2=agent_count, 3=gate_count, 8=has_data_node
+# Indices 4-7 are hash buckets (edge_sig, param, prompt, knob) — excluded.
+STRUCTURAL_AXES: tuple[int, ...] = (0, 1, 2, 3, 8)
+
+
 class MAPElitesArchive:
     """4D fixed-resolution grid archive for quality-diversity search.
 
@@ -125,15 +131,43 @@ class MAPElitesArchive:
     def all_individuals(self) -> list[Individual]:
         return list(self._grid.values())
 
-    def sample_parent(self, tournament_size: int = 3) -> Individual | None:
-        """Tournament selection: pick tournament_size random individuals, return the best."""
+    def sample_parent(
+        self,
+        tournament_size: int = 3,
+        rank_weighted: bool = False,
+        auto_rank_weighted: bool = True,
+        auto_rank_cell_threshold: int = 8,
+    ) -> Individual | None:
+        """Tournament selection: pick tournament_size individuals, return the best.
+
+        When ``rank_weighted=True``, individuals are drawn with probability
+        proportional to their rank (best=N, worst=1) instead of uniformly.
+        This biases toward stronger parents while still allowing weaker
+        individuals a small chance, preserving diversity.
+
+        When ``auto_rank_weighted=True`` (default), rank-weighted selection
+        activates automatically when the archive reaches
+        ``auto_rank_cell_threshold`` occupied cells, mirroring
+        ``on_plateau()``'s pattern of adapting strategy when the search
+        state calls for it.
+        """
         import random
 
         individuals = list(self._grid.values())
         if not individuals:
             return None
         k = min(tournament_size, len(individuals))
-        tournament = random.sample(individuals, k)
+
+        use_rank = rank_weighted
+        if not use_rank and auto_rank_weighted and len(individuals) >= auto_rank_cell_threshold:
+            use_rank = True
+
+        if use_rank and len(individuals) >= 2:
+            ranked = sorted(individuals, key=lambda i: i.score)
+            weights = [rank + 1.0 for rank in range(len(ranked))]
+            tournament = random.choices(ranked, weights=weights, k=k)
+        else:
+            tournament = random.sample(individuals, k)
         return max(tournament, key=lambda i: i.score)
 
     def pareto_front(self) -> list[Individual]:
@@ -165,21 +199,27 @@ class MAPElitesArchive:
         return front
 
     def diversity_metric(self) -> float:
-        """Fraction of occupied cells relative to a reasonable grid size estimate.
+        """Fraction of occupied cells in the structural-axis subspace.
 
         Returns 0.0 for empty archive, approaches 1.0 as more cells are filled.
+        Uses 5 structural axes from the 9-tuple returned by compute_features():
+          depth (0), fork_degree (1), agent_count (2), gate_count (3), has_data_node (8).
+        Hash-bucket axes (4-7: edge_sig, param, prompt, knob) are excluded because
+        their high cardinality inflates the denominator without reflecting structural diversity.
         """
         if not self._grid:
             return 0.0
-        unique_per_axis: list[set[int]] = [set() for _ in range(4)]
+        sample_key = next(iter(self._grid))
+        axes = [a for a in STRUCTURAL_AXES if a < len(sample_key)]
+        unique_per_axis: list[set[int]] = [set() for _ in axes]
         for key in self._grid:
-            for i, v in enumerate(key):
-                if i < 4:
-                    unique_per_axis[i].add(v)
+            for idx, a in enumerate(axes):
+                unique_per_axis[idx].add(key[a])
         total_possible = 1
         for s in unique_per_axis:
             total_possible *= max(len(s), 1)
-        return len(self._grid) / max(total_possible, 1)
+        structural_cells = {tuple(key[a] for a in axes) for key in self._grid}
+        return len(structural_cells) / max(total_possible, 1)
 
     def save(self, directory: Path) -> None:
         """Serialize the archive to a directory."""

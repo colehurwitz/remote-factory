@@ -39,6 +39,13 @@ log = structlog.get_logger()
 PLATEAU_WINDOW = 3
 
 
+def _auto_frozen_nodes(workflow: Workflow) -> set[str]:
+    """Return node IDs that should always be frozen during mutation."""
+    from factory.workflow.primitives import DataNode
+
+    return {nid for nid, node in workflow.nodes.items() if isinstance(node, DataNode)}
+
+
 class BudgetTracker:
     """Tracks evaluation budget consumption, cost, and wall-clock time."""
 
@@ -113,7 +120,7 @@ class SwarmEngine:
         self._score_trajectory: list[float] = []
         self._mode_registry = mode_registry
         self._project_dir = project_dir
-        self._reflector = OuterLoopReflector(project_dir=project_dir)
+        self._reflector = OuterLoopReflector(project_dir=project_dir, llm_reflect=True)
         self._last_reflection: ReflectionReport | None = None
         self._initial_diversity: float = 0.0
         self._top_ids_history: list[frozenset[str]] = []
@@ -169,7 +176,7 @@ class SwarmEngine:
                 base_workflow,
                 self._strategy,
                 generation=0,
-                frozen_nodes=set(cfg.frozen_node_ids),
+                frozen_nodes=set(cfg.frozen_node_ids) | _auto_frozen_nodes(base_workflow),
             )
             if result is None:
                 continue
@@ -268,10 +275,16 @@ class SwarmEngine:
         # Reflect on this generation's results
         if generation > 0 or len(population.individuals) >= 2:
             records = []
+            kvbi: dict[str, dict[str, object]] = {}
             for ind in population.individuals:
                 cycle_rec = self._evaluator.get_cycle_record(ind.id)
                 records.append((ind.id, ind.score, cycle_rec))
-            self._last_reflection = self._reflector.reflect(records, generation)
+                ind_wf = Workflow.from_dict(ind.workflow_data)  # type: ignore[arg-type]
+                if ind_wf.knob_values:
+                    kvbi[ind.id] = dict(ind_wf.knob_values)
+            self._last_reflection = self._reflector.reflect(
+                records, generation, knob_values_by_id=kvbi,
+            )
 
         # Select parents and create offspring
         mutations_applied: list[MutationRecord] = []
@@ -281,7 +294,10 @@ class SwarmEngine:
 
         mutation_rate = self._strategy.get_mutation_rate(generation)
         for _ in range(self._config.population_size):
-            parent = self._archive.sample_parent(self._config.tournament_size)
+            parent = self._archive.sample_parent(
+                self._config.tournament_size,
+                rank_weighted=self._config.rank_weighted_selection,
+            )
             if parent is None:
                 continue
             parent_wf = Workflow.from_dict(parent.workflow_data)  # type: ignore[arg-type]
@@ -289,7 +305,7 @@ class SwarmEngine:
                 parent_wf,
                 self._strategy,
                 generation,
-                frozen_nodes=set(self._config.frozen_node_ids),
+                frozen_nodes=set(self._config.frozen_node_ids) | _auto_frozen_nodes(parent_wf),
                 reflection_report=self._last_reflection,
             )
             if mutation_result is None:

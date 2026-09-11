@@ -62,7 +62,7 @@ class TestPopulation:
         ind = Population.make_individual(simple_workflow, generation=1, score=0.8)
         assert ind.generation == 1
         assert ind.score == 0.8
-        assert len(ind.features) == 4
+        assert len(ind.features) == 9
         assert ind.parent_id is None
 
     def test_serialization_round_trip(self, simple_workflow: Workflow, tmp_path: Path) -> None:
@@ -175,3 +175,72 @@ class TestMAPElitesArchive:
         assert loaded.size == 2
         assert loaded.best() is not None
         assert loaded.best().id == "b"  # type: ignore[union-attr]
+
+
+class TestRankWeightedSelection:
+    def test_rank_weighted_biases_toward_best(self) -> None:
+        archive = MAPElitesArchive()
+        archive.add(Individual(id="bad", workflow_data={}, score=-100.0, features=(0, 0, 1, 0)))
+        archive.add(Individual(id="ok", workflow_data={}, score=0.0, features=(1, 0, 1, 0)))
+        archive.add(Individual(id="good", workflow_data={}, score=100.0, features=(2, 0, 1, 0)))
+        counts: dict[str, int] = {"bad": 0, "ok": 0, "good": 0}
+        for _ in range(300):
+            p = archive.sample_parent(tournament_size=1, rank_weighted=True)
+            assert p is not None
+            counts[p.id] += 1
+        # With rank weighting (weights 1,2,3), "good" should be picked ~50% of the time
+        assert counts["good"] > counts["bad"]
+        assert counts["good"] > 100  # at least ~33%
+
+    def test_rank_weighted_false_is_uniform(self) -> None:
+        archive = MAPElitesArchive()
+        archive.add(Individual(id="a", workflow_data={}, score=-1000.0, features=(0, 0, 1, 0)))
+        archive.add(Individual(id="b", workflow_data={}, score=1000.0, features=(1, 0, 1, 0)))
+        counts: dict[str, int] = {"a": 0, "b": 0}
+        for _ in range(200):
+            p = archive.sample_parent(tournament_size=1, rank_weighted=False, auto_rank_weighted=False)
+            assert p is not None
+            counts[p.id] += 1
+        # Uniform: both should be roughly 50/50
+        assert counts["a"] > 50
+        assert counts["b"] > 50
+
+
+class TestAutoRankWeighted:
+    def test_auto_activates_by_cell_count(self) -> None:
+        archive = MAPElitesArchive()
+        for i in range(10):
+            archive.add(Individual(id=f"i{i}", workflow_data={}, score=i * 10.0, features=(i,)))
+        counts: dict[str, int] = {}
+        for _ in range(300):
+            p = archive.sample_parent(tournament_size=1, auto_rank_cell_threshold=8)
+            assert p is not None
+            counts[p.id] = counts.get(p.id, 0) + 1
+        # With auto rank-weighted, best should be picked more often
+        assert counts.get("i9", 0) > counts.get("i0", 0)
+
+    def test_auto_stays_uniform_below_thresholds(self) -> None:
+        archive = MAPElitesArchive()
+        archive.add(Individual(id="a", workflow_data={}, score=10.0, features=(0,)))
+        archive.add(Individual(id="b", workflow_data={}, score=11.0, features=(1,)))
+        # 2 cells < 8 threshold, variance ~0.25 < 1000 threshold
+        counts: dict[str, int] = {"a": 0, "b": 0}
+        for _ in range(200):
+            p = archive.sample_parent(tournament_size=1)
+            assert p is not None
+            counts[p.id] += 1
+        assert counts["a"] > 50
+        assert counts["b"] > 50
+
+    def test_auto_disabled(self) -> None:
+        archive = MAPElitesArchive()
+        for i in range(10):
+            archive.add(Individual(id=f"i{i}", workflow_data={}, score=i * 100.0, features=(i,)))
+        counts: dict[str, int] = {}
+        for _ in range(300):
+            p = archive.sample_parent(tournament_size=1, auto_rank_weighted=False)
+            assert p is not None
+            counts[p.id] = counts.get(p.id, 0) + 1
+        # Without auto, uniform sampling — worst should get ~10% (1/10)
+        assert counts.get("i0", 0) > 10
+

@@ -20,6 +20,25 @@ if TYPE_CHECKING:
 
 log = structlog.get_logger()
 
+# Boolean-flag env vars that switch Claude Code onto a 3P backend (their own credentials,
+# never the OAuth keychain), as opposed to ANTHROPIC_API_KEY which carries the key itself.
+_BARE_COMPATIBLE_BACKEND_FLAGS = ("CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_BEDROCK")
+
+
+def _supports_bare_mode(env: dict[str, str]) -> bool:
+    """True when the environment implies API-key-style auth, not OAuth/keychain login.
+
+    `--bare` skips keychain reads entirely (see `claude --help`), so it only works when
+    auth is ANTHROPIC_API_KEY or a 3P backend (Vertex/Bedrock). Passing it unconditionally
+    breaks subscription (Pro/Max) logins, which live in the keychain — see #1437.
+    """
+    if env.get("ANTHROPIC_API_KEY", "").strip():
+        return True
+    return any(
+        env.get(var, "").strip().lower() in ("1", "true", "yes")
+        for var in _BARE_COMPATIBLE_BACKEND_FLAGS
+    )
+
 
 def _make_ceo_message_emitter(project_path: Path) -> Callable[[bytes], None]:
     """Return a callback that emits ceo.message events for assistant JSONL lines."""
@@ -73,6 +92,11 @@ def _parse_usage(data: dict) -> AgentUsage:
     )
 
 
+def _claude_bin() -> str:
+    """Return the Claude CLI binary name, respecting FACTORY_CLAUDE_BIN override."""
+    return os.environ.get("FACTORY_CLAUDE_BIN") or "claude"
+
+
 class ClaudeRunner:
     """Runner implementation for Claude Code CLI."""
 
@@ -85,7 +109,7 @@ class ClaudeRunner:
         return RunnerMeta(
             name="claude",
             display_name="Claude Code",
-            binary="claude",
+            binary=_claude_bin(),
             install_hint="npm install -g @anthropic-ai/claude-code",
             supports_usage_telemetry=True,
             supports_session_name=True,
@@ -108,7 +132,7 @@ class ClaudeRunner:
         prompt_path = Path(prompt_file.name)
 
         cmd = [
-            "claude",
+            _claude_bin(),
             "--append-system-prompt-file",
             prompt_file.name,
             "-p",
@@ -116,9 +140,10 @@ class ClaudeRunner:
             "--output-format",
             "stream-json",
             "--verbose",
-            "--disallowedTools",
-            "Agent",
         ]
+        if _supports_bare_mode(dict(os.environ)):
+            cmd.append("--bare")
+        cmd.extend(["--disallowedTools", "Agent"])
         settings_file = request.extras.get("settings_file")
         if settings_file:
             cmd.extend(["--settings", str(settings_file)])
@@ -297,10 +322,12 @@ class ClaudeRunner:
         temp_files.append(settings_path)
 
         cmd = [
-            "claude",
+            _claude_bin(),
             "--append-system-prompt-file",
             prompt_file.name,
         ]
+        if _supports_bare_mode(dict(os.environ)):
+            cmd.append("--bare")
         settings_file = request.extras.get("settings_file")
         if settings_file:
             cmd.extend(["--settings", str(settings_file)])

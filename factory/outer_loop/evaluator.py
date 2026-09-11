@@ -1,7 +1,7 @@
 """Fitness evaluation for workflow candidates in the evolutionary search.
 
 Supports both legacy EvaluatorFn protocol (DirectFeatureBenchEvaluator) and
-InnerLoop-based evaluation (FeatureBenchInnerLoop). CycleRecordCache provides
+InnerLoop-based evaluation via compose(). CycleRecordCache provides
 content-addressable caching keyed by workflow hash.
 """
 
@@ -87,8 +87,8 @@ class CycleRecordCache:
                 if not line:
                     continue
                 try:
-                    entry = json.loads(line)
-                    existing_hashes.add(entry.get("workflow_hash", ""))
+                    existing = json.loads(line)
+                    existing_hashes.add(existing.get("workflow_hash", ""))
                 except json.JSONDecodeError:
                     continue
 
@@ -96,7 +96,7 @@ class CycleRecordCache:
         for wf_hash, record in self._cache.items():
             if wf_hash in existing_hashes:
                 continue
-            entry = {
+            entry: dict[str, Any] = {
                 "workflow_hash": wf_hash,
                 "score": record.score_end,
                 "cost": record.total_cost_usd,
@@ -104,6 +104,10 @@ class CycleRecordCache:
                 "reverted": record.reverted,
                 "timestamp": record.ended_at or record.started_at,
             }
+            if record.eval_details is not None:
+                entry["eval_details"] = record.eval_details
+            if record.instance_results is not None:
+                entry["instance_results"] = record.instance_results
             new_entries.append(json.dumps(entry, separators=(",", ":")))
 
         if new_entries:
@@ -144,6 +148,8 @@ class CycleRecordCache:
                 kept=entry.get("kept", 0),
                 reverted=entry.get("reverted", 0),
                 total_cost_usd=entry.get("cost", 0.0),
+                instance_results=entry.get("instance_results"),
+                eval_details=entry.get("eval_details"),
             )
             self._cache[wf_hash] = record
             loaded += 1
@@ -300,8 +306,13 @@ class SwarmEvaluator:
         instances: list[str],
         individual_id: str | None = None,
     ) -> EvalResult:
-        """Evaluate using InnerLoop.step() in an isolated worktree."""
-        from factory.outer_loop.featurebench_inner_loop import FeatureBenchInnerLoop
+        """Evaluate using InnerLoop.step() in an isolated worktree.
+
+        When a Task is available via self._config.get_task(), uses compose()
+        to construct a task-attached InnerLoop. Falls back to InnerLoop()
+        directly for backward compat with legacy flat-field configs.
+        """
+        from factory.inner_loop import InnerLoop
 
         cached_record = self._cycle_cache.get(workflow)
         if cached_record is not None:
@@ -314,20 +325,38 @@ class SwarmEvaluator:
 
         wt_path: Path | None = None
         try:
-            mode_name = self._inner_loop_factory(workflow) if callable(self._inner_loop_factory) else "evolve"
+            task = self._config.get_task() if hasattr(self._config, "get_task") else None
+
+            if task is not None:
+                mode_name = "task-eval"
+            else:
+                mode_name = self._inner_loop_factory(workflow) if callable(self._inner_loop_factory) else "evolve"
 
             label = individual_id[:8] if individual_id else mode_name[:12]
             wt_path = self._create_worktree(project_dir, label)
 
-            loop = FeatureBenchInnerLoop(
-                project_dir=wt_path,
-                mode=mode_name,
-                workflow=workflow,
-                frozen_nodes=frozenset(self._config.frozen_node_ids),
-                test_command=self._config.test_command,
-                test_format=self._config.test_format,
-                metric_path=self._config.metric_path,
-            )
+            if task is not None:
+                from factory.compose import compose
+
+                loop = compose(workflow, task, wt_path)
+                loop.mode = mode_name
+                loop.frozen_nodes = frozenset(self._config.frozen_node_ids)
+                loop.test_command = self._config.test_command
+                loop.test_format = self._config.test_format or "pytest"
+                loop.metric_path = self._config.metric_path
+                if instances:
+                    from factory.outer_loop.subset import FixedSubsetSelector
+                    loop._subset_selector = FixedSubsetSelector(instances)
+            else:
+                loop = InnerLoop(
+                    project_dir=wt_path,
+                    mode=mode_name,
+                    workflow=workflow,
+                    frozen_nodes=frozenset(self._config.frozen_node_ids),
+                    test_command=self._config.test_command,
+                    test_format=self._config.test_format,
+                    metric_path=self._config.metric_path,
+                )
             record = loop.step()
 
             summary_data = self._read_cycle_summary(wt_path, loop.mode)
@@ -356,6 +385,25 @@ class SwarmEvaluator:
                 details["scoring_method"] = summary_data.get("scoring_method", "unknown")
                 if "test_details" in summary_data:
                     details["test_details"] = summary_data["test_details"]
+
+            if isinstance(record.instance_results, list) and record.instance_results:
+                from factory.outer_loop.verify_adapter import (
+                    eval_result_from_verify_results,
+                )
+                from factory.task import VerifyResult
+
+                verify_results: list[VerifyResult] = []
+                for ir in record.instance_results:
+                    if isinstance(ir, dict):
+                        verify_results.append(VerifyResult(
+                            passed=bool(ir.get("passed", False)),
+                            score=float(ir.get("score", 0.0)),
+                            details=ir.get("details", {}),
+                        ))
+                adapted = eval_result_from_verify_results(verify_results)
+                details["verify"] = adapted.details
+
+            record.eval_details = details
 
             return EvalResult(
                 score=composite,

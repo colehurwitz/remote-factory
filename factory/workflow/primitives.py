@@ -158,6 +158,8 @@ class GateNode(Node):
     evaluator_role: AgentRole | None = None
     evaluator_command: str | None = None
     gate_prompt: str = ""
+    max_iterations: int | None = None
+    """Cap for this gate's reloop edge. ``None`` leaves the cap to the runtime."""
 
 
 class ForkNode(Node):
@@ -191,6 +193,51 @@ class SubgraphForkNode(Node):
     worktree_isolated: bool = True
 
 
+class DataItem(BaseModel):
+    """Standardized data payload for per-item workflow iteration."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    id: str
+    path: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+    prompt: str = ""
+
+
+class DataNode(Node):
+    """Node that loads data items and drives per-item execution of a subgraph."""
+
+    model_config = ConfigDict(strict=True, extra="forbid")
+
+    task_ref: str | None = None
+    source_path: str | None = None
+    source_format: Literal["directory", "jsonl", "csv"] | None = None
+    inline_items: list[DataItem] = Field(default_factory=list)
+    subgraph_entry: str
+    subgraph_exit: str
+    parallelism: int = Field(default=1, ge=1)
+    split: Literal["train", "val", "test", "all"] = "all"
+    shuffle: bool = False
+    shuffle_seed: int | None = None
+    limit: int | None = None
+    max_items: int = 500
+
+    @model_validator(mode="after")
+    def _validate_source(self) -> DataNode:
+        sources = [
+            self.task_ref is not None,
+            self.source_path is not None,
+            bool(self.inline_items),
+        ]
+        if sum(sources) != 1:
+            raise ValueError(
+                "Exactly one of task_ref, source_path, or inline_items must be set"
+            )
+        if self.source_path is not None and self.source_format is None:
+            raise ValueError("source_path requires source_format to be set")
+        return self
+
+
 class SelectionNode(Node):
     """Compare N completed experiment branches and select the best."""
 
@@ -222,15 +269,17 @@ class LLMNode(Node):
     """Node that makes direct LLM API calls with a configurable tool-use loop.
 
     Unlike AgentNode (full CLI subprocess), this runs the API loop in-process
-    with a minimal, configurable tool set.
+    with a minimal, configurable tool set. ``model`` and ``provider`` default to
+    neutral values (``""`` / ``"auto"``): a graph that does not pin them leaves
+    the choice to the runtime, so the same graph runs on any provider.
     """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
     system_prompt: str = ""
     instance_prompt: str = ""
-    model: str = "sonnet"
-    provider: Literal["anthropic", "vertex", "litellm"] = "anthropic"
+    model: str = ""
+    provider: Literal["auto", "anthropic", "vertex", "litellm"] = "auto"
     max_tokens: int = 8192
     max_turns: int = 50
     temperature: float = 0.0
@@ -244,20 +293,38 @@ class LLMNode(Node):
 
 
 class Edge(BaseModel):
-    """Directed edge in the workflow graph with optional verdict condition."""
+    """Directed edge in the workflow graph with an optional labelled condition.
+
+    ``condition`` is normally one of the three ``VerdictType`` labels, but a gate
+    may name its own forward outcomes (a switch rather than a binary decision).
+    Arbitrary labels are stored verbatim and lowercased by consumers before
+    matching, so ``"DRAFT"`` from an evaluator matches ``condition="draft"``.
+    """
 
     model_config = ConfigDict(strict=True, extra="forbid")
 
     source: str
     target: str
-    condition: VerdictType | None = None
+    condition: VerdictType | str | None = None
+
+    @property
+    def condition_label(self) -> str | None:
+        """Return the condition as a plain string, or ``None``.
+
+        ``VerdictType.PROCEED`` → ``"proceed"`` (not ``"VerdictType.PROCEED"``).
+        Plain ``str`` conditions are returned as-is.
+        """
+        if self.condition is None:
+            return None
+        return self.condition.value if isinstance(self.condition, VerdictType) else self.condition
 
 
 # ── workflow ─────────────────────────────────────────────────────
 
 
 NodeType = (
-    AgentNode | FnNode | GateNode | ForkNode | JoinNode | SubgraphForkNode | SelectionNode | Study | LLMNode
+    AgentNode | FnNode | GateNode | ForkNode | JoinNode | SubgraphForkNode
+    | SelectionNode | Study | LLMNode | DataNode
 )
 
 
@@ -274,7 +341,12 @@ class Workflow(BaseModel):
     edges: list[Edge]
     start_node: str
     terminal: bool = False
+    task: str | None = Field(default=None)
     trigger: TriggerFn | None = Field(default=None, exclude=True)
+    knob_values: dict[str, str | float] = Field(default_factory=dict)
+    knob_bounds: dict[str, list[str | float]] = Field(default_factory=dict)
+    knob_expandable: dict[str, str] = Field(default_factory=dict)
+    declared_capabilities: frozenset[str] = frozenset()
 
     def validate_graph(self) -> list[str]:
         """Validate workflow graph structure using NetworkX. Returns list of issues."""
@@ -307,22 +379,42 @@ class Workflow(BaseModel):
         return Workflow(name=name, nodes=nodes, edges=edges, start_node=start_node)
 
     def to_dict(self) -> dict[str, Any]:
-        """Serialize the workflow to a JSON-safe dict."""
+        """Serialize the workflow to a JSON-safe dict.
+
+        ``reads`` and ``writes`` are sets, whose iteration order is not stable
+        across processes; they are sorted here so that a given graph always
+        serializes to identical bytes.
+        """
         nodes_out: dict[str, Any] = {}
         for nid, node in self.nodes.items():
             d = node.model_dump(mode="json")
+            for field_name in ("reads", "writes"):
+                value = d.get(field_name)
+                if isinstance(value, list):
+                    d[field_name] = sorted(value)
             d["_type"] = type(node).__name__
             nodes_out[nid] = d
 
         edges_out = [e.model_dump(mode="json") for e in self.edges]
 
-        return {
+        result: dict[str, Any] = {
             "name": self.name,
             "nodes": nodes_out,
             "edges": edges_out,
             "start_node": self.start_node,
             "terminal": self.terminal,
         }
+        if self.task is not None:
+            result["task"] = self.task
+        if self.knob_values:
+            result["knob_values"] = dict(self.knob_values)
+        if self.knob_bounds:
+            result["knob_bounds"] = {k: list(v) for k, v in self.knob_bounds.items()}
+        if self.knob_expandable:
+            result["knob_expandable"] = dict(self.knob_expandable)
+        if self.declared_capabilities:
+            result["declared_capabilities"] = sorted(self.declared_capabilities)
+        return result
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> Workflow:
@@ -337,6 +429,7 @@ class Workflow(BaseModel):
             "SelectionNode": SelectionNode,
             "Study": Study,
             "LLMNode": LLMNode,
+            "DataNode": DataNode,
         }
         _SET_FIELDS = {"reads", "writes"}
 
@@ -360,6 +453,11 @@ class Workflow(BaseModel):
             edges=edges,
             start_node=data["start_node"],
             terminal=data.get("terminal", False),
+            task=data.get("task"),
+            knob_values=data.get("knob_values", {}),
+            knob_bounds={k: list(v) for k, v in data.get("knob_bounds", {}).items()},
+            knob_expandable=data.get("knob_expandable", {}),
+            declared_capabilities=frozenset(data.get("declared_capabilities", [])),
         )
 
 

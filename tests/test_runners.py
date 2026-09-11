@@ -122,6 +122,79 @@ class TestClaudeRunner:
             ]
 
 
+class TestFactoryClaudeBin:
+    """Tests for FACTORY_CLAUDE_BIN binary override."""
+
+    async def test_headless_respects_factory_claude_bin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_CLAUDE_BIN", "glaude")
+        runner = ClaudeRunner()
+
+        with patch(
+            "factory.runners._subprocess.stream_subprocess", new_callable=AsyncMock
+        ) as mock_stream:
+            mock_stream.return_value = (
+                b'{"result":"ok","usage":{},"cost_usd":0,"duration_ms":0,"num_turns":1,"model":"m"}',
+                b"",
+            )
+            with patch(
+                "factory.runners._subprocess.asyncio.create_subprocess_exec",
+                new_callable=AsyncMock,
+            ) as mock_exec:
+                mock_proc = AsyncMock()
+                mock_proc.returncode = 0
+                mock_exec.return_value = mock_proc
+
+                await runner.headless(
+                    AgentRunRequest(prompt="test", task="hi", cwd=tmp_path, timeout=10.0)
+                )
+
+                cmd = list(mock_exec.call_args[0])
+                assert cmd[0] == "glaude"
+
+    def test_interactive_respects_factory_claude_bin(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_CLAUDE_BIN", "glaude")
+        runner = ClaudeRunner()
+
+        with patch("subprocess.run") as mock_run:
+            mock_run.return_value = type("Result", (), {"returncode": 0})()
+            runner.interactive_run(
+                AgentRunRequest(prompt="test", task="hi", cwd=tmp_path)
+            )
+            cmd = mock_run.call_args[0][0]
+            assert cmd[0] == "glaude"
+
+    def test_metadata_respects_factory_claude_bin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_CLAUDE_BIN", "glaude")
+        meta = ClaudeRunner.metadata()
+        assert meta.binary == "glaude"
+
+    def test_defaults_to_claude_without_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("FACTORY_CLAUDE_BIN", raising=False)
+        runner = ClaudeRunner()
+        cmd, _, _ = runner.build_command(
+            AgentRunRequest(prompt="test", task="hi", cwd=tmp_path, timeout=10.0)
+        )
+        assert cmd[0] == "claude"
+
+    def test_empty_string_falls_back_to_claude(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FACTORY_CLAUDE_BIN", "")
+        runner = ClaudeRunner()
+        cmd, _, _ = runner.build_command(
+            AgentRunRequest(prompt="test", task="hi", cwd=tmp_path, timeout=10.0)
+        )
+        assert cmd[0] == "claude"
+
+
 class TestInteractiveBackupRestore:
     def test_restores_backup_after_interactive_run(self, tmp_path: Path) -> None:
         claude_dir = tmp_path / ".claude"
@@ -1192,6 +1265,101 @@ class TestDisallowedAgentTool:
             wrapper_content = Path(wrapper_script_path).read_text()
             assert "--disallowedTools" in wrapper_content
             assert "Agent" in wrapper_content
+
+
+class TestBareModeGating:
+    """--bare skips OAuth/keychain reads, so it must only be passed under API-key-style
+    auth — never for subscription (Pro/Max) logins. Regression coverage for #1437.
+    """
+
+    def _clear_auth_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        for var in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_BEDROCK"):
+            monkeypatch.delenv(var, raising=False)
+
+    def test_supports_bare_mode_true_for_api_key(self) -> None:
+        from factory.runners.claude import _supports_bare_mode
+
+        assert _supports_bare_mode({"ANTHROPIC_API_KEY": "sk-ant-test"}) is True
+
+    def test_supports_bare_mode_true_for_vertex(self) -> None:
+        from factory.runners.claude import _supports_bare_mode
+
+        assert _supports_bare_mode({"CLAUDE_CODE_USE_VERTEX": "1"}) is True
+
+    def test_supports_bare_mode_true_for_bedrock(self) -> None:
+        from factory.runners.claude import _supports_bare_mode
+
+        assert _supports_bare_mode({"CLAUDE_CODE_USE_BEDROCK": "true"}) is True
+
+    def test_supports_bare_mode_false_when_no_auth_vars(self) -> None:
+        from factory.runners.claude import _supports_bare_mode
+
+        assert _supports_bare_mode({}) is False
+
+    def test_supports_bare_mode_false_for_blank_or_falsy_values(self) -> None:
+        from factory.runners.claude import _supports_bare_mode
+
+        assert _supports_bare_mode({"ANTHROPIC_API_KEY": "  "}) is False
+        assert _supports_bare_mode({"CLAUDE_CODE_USE_VERTEX": "0"}) is False
+        assert _supports_bare_mode({"CLAUDE_CODE_USE_BEDROCK": "false"}) is False
+
+    def test_build_command_omits_bare_without_api_key_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._clear_auth_env(monkeypatch)
+        runner = ClaudeRunner()
+        cmd, _, temp_files = runner.build_command(
+            AgentRunRequest(prompt="Test", task="Test", cwd=tmp_path)
+        )
+
+        assert "--bare" not in cmd
+
+        for f in temp_files:
+            f.unlink(missing_ok=True)
+
+    def test_build_command_includes_bare_with_api_key_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._clear_auth_env(monkeypatch)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-test")
+        runner = ClaudeRunner()
+        cmd, _, temp_files = runner.build_command(
+            AgentRunRequest(prompt="Test", task="Test", cwd=tmp_path)
+        )
+
+        assert "--bare" in cmd
+
+        for f in temp_files:
+            f.unlink(missing_ok=True)
+
+    def test_build_interactive_command_omits_bare_without_api_key_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._clear_auth_env(monkeypatch)
+        runner = ClaudeRunner()
+        cmd, _, temp_files = runner.build_interactive_command(
+            AgentRunRequest(prompt="Test", task="Test", cwd=tmp_path)
+        )
+
+        assert "--bare" not in cmd
+
+        for f in temp_files:
+            f.unlink(missing_ok=True)
+
+    def test_build_interactive_command_includes_bare_with_vertex_auth(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        self._clear_auth_env(monkeypatch)
+        monkeypatch.setenv("CLAUDE_CODE_USE_VERTEX", "1")
+        runner = ClaudeRunner()
+        cmd, _, temp_files = runner.build_interactive_command(
+            AgentRunRequest(prompt="Test", task="Test", cwd=tmp_path)
+        )
+
+        assert "--bare" in cmd
+
+        for f in temp_files:
+            f.unlink(missing_ok=True)
 
 
 class TestGetRunnerChoices:

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 from factory.cycle_analyzer import CycleAnalyzer, CycleRecord
-from factory.workflow.primitives import Workflow
+from factory.workflow.primitives import DataNode, Workflow
 
 
 @dataclass
@@ -117,8 +117,10 @@ class InnerLoop:
         workflow: Workflow | None = None,
         frozen_nodes: frozenset[str] = frozenset(),
         test_command: str = "",
-        test_format: str = "pytest",
+        test_format: str | None = None,
         metric_path: str = "score",
+        task: Any | None = None,
+        instance: Any | None = None,
     ) -> None:
         self.project_dir = Path(project_dir).resolve()
         self.factory_dir = self.project_dir / ".factory"
@@ -127,11 +129,26 @@ class InnerLoop:
         self.workflow = workflow
         self.frozen_nodes = frozenset(frozen_nodes)
         self.test_command = test_command
-        self.test_format = test_format
+        self.test_format = test_format or "pytest"
         self.metric_path = metric_path
+        self.task = task
+        self.instance = instance
         self._step_count = 0
         self._history: list[CycleRecord] = []
+        self._has_data_node: bool | None = None
         self._validate_frozen_nodes()
+
+        # When task is set, derive flat fields from it for backward compat
+        if self.task is not None:
+            defn = getattr(self.task, "definition", None)
+            if defn is not None:
+                if not self.test_command and hasattr(defn, "verify_config"):
+                    self.test_command = defn.verify_config.command
+                if hasattr(defn, "scoring"):
+                    scoring = defn.scoring
+                    method = getattr(scoring, "method", "pytest")
+                    if test_format is None:
+                        self.test_format = method
 
     def _validate_frozen_nodes(self) -> None:
         if not self.frozen_nodes or self.workflow is None:
@@ -181,14 +198,19 @@ class InnerLoop:
     def step(self, directives: dict[str, Any] | None = None) -> CycleRecord:
         """Run one inner-loop cycle and return structured results.
 
-        1. Write directives (steering from outer loop) if provided
-        2. Snapshot artifact offsets for isolation
-        3. Run the factory mode via subprocess
-        4. Write cycle_summary.json with observable outcomes
-        5. CycleAnalyzer reads only new execution artifacts (scoped by offset)
-        6. Evaluator parses eval-specific artifacts (scores, metrics)
-        7. Return composed CycleRecord
+        When self.task is None (default): runs the factory mode via subprocess
+        (existing behavior, byte-for-byte backward compat).
+
+        When self.task is set: iterates task.instances(), runs
+        setup → WorkflowExecutor → verify per instance, aggregates scores
+        via AggregateMethod from InnerLoopConfig.
         """
+        if self.task is not None:
+            return self._step_with_task(directives)
+        return self._step_subprocess(directives)
+
+    def _step_subprocess(self, directives: dict[str, Any] | None = None) -> CycleRecord:
+        """Original subprocess-based step (task is None path)."""
         if directives:
             self._write_directives(directives)
 
@@ -231,6 +253,216 @@ class InnerLoop:
         if result.returncode != 0:
             record.errored = (record.errored or 0) + 1
         record.cycle_number = self._step_count + 1
+        self._step_count += 1
+        self._history.append(record)
+        return record
+
+    def _workflow_has_data_node(self) -> bool:
+        if self._has_data_node is None:
+            self._has_data_node = (
+                self.workflow is not None
+                and any(isinstance(n, DataNode) for n in self.workflow.nodes.values())
+            )
+        return self._has_data_node
+
+    def _step_with_task(self, directives: dict[str, Any] | None = None) -> CycleRecord:
+        """Task-driven step: setup → WorkflowExecutor → verify per instance."""
+        assert self.task is not None
+        assert self.workflow is not None
+        import asyncio
+        import statistics
+
+        from factory.models import AggregateMethod, InnerLoopConfig
+        from factory.workflow.executor import WorkflowExecutor
+
+        if directives:
+            self._write_directives(directives)
+
+        if self._workflow_has_data_node():
+            return self._step_with_data_node(directives)
+
+        event_offset = self._count_lines(self.factory_dir / "events.jsonl")
+
+        t0 = time.monotonic()
+        workflow = self.workflow
+
+        all_instances = list(self.task.instances())
+
+        subset_selector = getattr(self, "_subset_selector", None)
+        if subset_selector is not None:
+            selected_ids = set(subset_selector.select(
+                [inst.id for inst in all_instances]
+            ))
+            all_instances = [i for i in all_instances if i.id in selected_ids]
+
+        instance_results: list[dict[str, Any]] = []
+        scores: list[float] = []
+
+        for inst in all_instances:
+            try:
+                self.task.setup(inst, self.project_dir)
+
+                prompt_text = self.task.prompt(inst)
+
+                executor = WorkflowExecutor(
+                    workflow,
+                    self.project_dir,
+                    initial_context=prompt_text,
+                )
+                exec_result = asyncio.run(executor.execute())
+
+                vr = self.task.verify(inst, self.project_dir)
+
+                vr_details = dict(vr.details)
+                vr_details["executor_success"] = exec_result.success
+                vr_details["executor_nodes_executed"] = exec_result.nodes_executed
+                vr_details["executor_duration_ms"] = exec_result.duration_ms
+                if exec_result.halted:
+                    vr_details["executor_halt_reason"] = exec_result.halt_reason
+
+                instance_results.append({
+                    "instance_id": inst.id,
+                    "passed": vr.passed,
+                    "score": vr.score,
+                    "details": vr_details,
+                })
+                scores.append(vr.score)
+            except Exception as exc:
+                instance_results.append({
+                    "instance_id": inst.id,
+                    "passed": False,
+                    "score": 0.0,
+                    "error": str(exc),
+                })
+                scores.append(0.0)
+
+        config = InnerLoopConfig()
+        aggregate_method = config.aggregate
+
+        if not scores:
+            aggregate_score = 0.0
+        elif aggregate_method == AggregateMethod.mean:
+            aggregate_score = statistics.mean(scores)
+        elif aggregate_method == AggregateMethod.median:
+            aggregate_score = statistics.median(scores)
+        elif aggregate_method == AggregateMethod.max:
+            aggregate_score = max(scores)
+        elif aggregate_method == AggregateMethod.all_pass:
+            aggregate_score = 1.0 if all(s >= 1.0 for s in scores) else 0.0
+        else:
+            aggregate_score = statistics.mean(scores)
+
+        duration_s = time.monotonic() - t0
+
+        analyzer = CycleAnalyzer(
+            self.factory_dir,
+            workflow=self.workflow,
+            event_offset=event_offset,
+        )
+        cost_record = analyzer.latest()
+        total_cost_usd = cost_record.total_cost_usd if cost_record else 0.0
+        cost_by_agent = cost_record.cost_by_agent if cost_record else {}
+
+        record = CycleRecord(
+            cycle_number=self._step_count + 1,
+            mode=self.mode,
+            started_at=None,
+            ended_at=None,
+            duration_s=duration_s,
+            score_start=None,
+            score_end=aggregate_score,
+            score_delta=None,
+            instance_results=instance_results,
+            total_cost_usd=total_cost_usd,
+            cost_by_agent=cost_by_agent,
+        )
+        record.frozen_nodes = sorted(self.frozen_nodes)
+        record.mutable_node_ids = sorted(self.mutable_nodes())
+
+        self._write_cycle_summary(
+            returncode=0,
+            event_offset=event_offset,
+            duration_ms=int(duration_s * 1000),
+            builder_committed=False,
+            experiments=0,
+            test_score=aggregate_score,
+            instance_results=instance_results,
+        )
+
+        self._step_count += 1
+        self._history.append(record)
+        return record
+
+    def _step_with_data_node(self, directives: dict[str, Any] | None = None) -> CycleRecord:
+        """Delegate to the executor when the workflow contains a DataNode."""
+        import asyncio
+        import json
+
+        from factory.workflow.executor import WorkflowExecutor
+
+        t0 = time.monotonic()
+
+        assert self.workflow is not None
+        executor = WorkflowExecutor(
+            self.workflow,
+            self.project_dir,
+        )
+        exec_result = asyncio.run(executor.execute())
+
+        duration_s = time.monotonic() - t0
+        score = 1.0 if exec_result.success else 0.0
+        instance_results: list[dict[str, Any]] | None = None
+
+        # Direct lookup: find DataNode ID and read its output
+        data_node_id: str | None = None
+        for nid, n in self.workflow.nodes.items():
+            if isinstance(n, DataNode):
+                data_node_id = nid
+                break
+
+        if data_node_id is not None and data_node_id in exec_result.node_outputs:
+            try:
+                parsed = json.loads(exec_result.node_outputs[data_node_id])
+                if isinstance(parsed, list) and parsed:
+                    scores = [r["score"] for r in parsed if "score" in r]
+                    if scores:
+                        score = sum(scores) / len(scores)
+                    instance_results = [
+                        {
+                            "instance_id": item.get("item_id", ""),
+                            "score": item.get("score", 0.0),
+                            "passed": item.get("passed", False),
+                        }
+                        for item in parsed
+                        if isinstance(item, dict)
+                    ]
+            except (json.JSONDecodeError, TypeError, KeyError):
+                pass
+
+        record = CycleRecord(
+            cycle_number=self._step_count + 1,
+            mode=self.mode,
+            started_at=None,
+            ended_at=None,
+            duration_s=duration_s,
+            score_start=None,
+            score_end=score,
+            score_delta=None,
+            instance_results=instance_results,
+        )
+        record.frozen_nodes = sorted(self.frozen_nodes)
+        record.mutable_node_ids = sorted(self.mutable_nodes())
+
+        self._write_cycle_summary(
+            returncode=0 if exec_result.success else 1,
+            event_offset=0,
+            duration_ms=int(duration_s * 1000),
+            builder_committed=False,
+            experiments=0,
+            test_score=score,
+            instance_results=instance_results,
+        )
+
         self._step_count += 1
         self._history.append(record)
         return record
@@ -406,6 +638,9 @@ class InnerLoop:
         experiments: int,
         test_score: float | None = None,
         test_details: dict[str, Any] | None = None,
+        instance_results: list[dict[str, Any]] | None = None,
+        kept: int = 0,
+        reverted: int = 0,
     ) -> Path:
         """Write a structured summary of observable outcomes from this cycle."""
         events_path = self.factory_dir / "events.jsonl"
@@ -467,9 +702,28 @@ class InnerLoop:
             "experiments": experiments,
             "duration_ms": duration_ms,
             "errors": errors,
+            "kept": kept,
+            "reverted": reverted,
         }
         if test_details:
             summary["test_details"] = test_details
+
+        if instance_results:
+            summary["instance_results"] = instance_results
+            from factory.outer_loop.verify_adapter import eval_result_from_verify_results
+            from factory.task import VerifyResult
+
+            verify_results = [
+                VerifyResult(
+                    passed=bool(ir.get("passed", False)),
+                    score=float(ir.get("score", 0.0)),
+                    details=ir.get("details") or {},
+                )
+                for ir in instance_results
+                if isinstance(ir, dict)
+            ]
+            adapted = eval_result_from_verify_results(verify_results)
+            summary["verify"] = adapted.details
 
         summary_dir = self.factory_dir / "outer_loop" / "runs" / self.mode
         summary_dir.mkdir(parents=True, exist_ok=True)

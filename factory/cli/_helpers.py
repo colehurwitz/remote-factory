@@ -17,17 +17,28 @@ log = structlog.get_logger()
 _WIZARD_INPUT_PATH = Path("~/.factory/wizard_input.md")
 
 
+DEAD_MODES: dict[str, str] = {
+    "build": "design",
+    "improve": "design",
+    "discover": "design",
+    "interactive": "design",
+    "parallel-improve": "design",
+}
+
+DESIGN_MODES = ("design", "design-v2")
+
+
+def _resolve_inactivity_timeout() -> float:
+    """Resolve sub-agent inactivity timeout from env or default (7200s)."""
+    return float(os.environ.get('FACTORY_AGENT_INACTIVITY_TIMEOUT', '7200'))
+
+
 CEO_MODES = [
     "auto",
     "auto-fresh",
-    "build",
-    "discover",
     "founder",
-    "improve",
     "meta",
     "design",
-    "interactive",
-    "parallel-improve",
     "research",
     "review",
     "deep-qa",
@@ -40,18 +51,16 @@ CEO_MODES = [
     "evolve",
     "deep-research",
     "outer-loop",
+    "create-v2",
 ]
 
 
 RUN_MODES = [
     "auto",
     "auto-fresh",
-    "build",
-    "discover",
+    "design",
     "founder",
-    "improve",
     "meta",
-    "parallel-improve",
     "research",
     "study",
     "swebench",
@@ -69,15 +78,10 @@ def get_all_ceo_modes() -> list[str]:
 
 DEPRECATED_MODES: frozenset[str] = frozenset(
     {
-        "build",
-        "improve",
         "research",
         "meta",
-        "discover",
         "review",
         "refine",
-        "parallel-improve",
-        "interactive",
     }
 )
 
@@ -87,12 +91,9 @@ def warn_deprecated_mode(mode: str) -> None:
     if mode not in DEPRECATED_MODES:
         return
     replacement = "design"
-    extra = ""
-    if mode == "interactive":
-        extra = " ('interactive' is an alias for 'design')"
     log.warning("deprecated_cli_mode", mode=mode, replacement=replacement)
     print(
-        f"WARNING: --mode {mode} is deprecated{extra}. "
+        f"WARNING: --mode {mode} is deprecated. "
         f"Use --mode {replacement} instead. "
         f"This mode remains functional but will be removed in a future release.",
         file=sys.stderr,
